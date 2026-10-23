@@ -107,7 +107,3 @@ Text on stderr/stdout, plus optional JSONL (`-o`):
 
 - Detection is heuristic. False positives are possible, especially for 109618.
 - `mod_php` may behave differently from PHP-FPM under keep-alive.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
