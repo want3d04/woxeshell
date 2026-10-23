@@ -1,0 +1,11 @@
+woxeshell
+woxeshell.exe
+*.jsonl
+*.json
+!example.json
+report.*
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
