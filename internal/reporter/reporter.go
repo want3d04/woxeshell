@@ -14,17 +14,19 @@ type Reporter interface {
 	Flush()
 	CountVulnerable() int
 	CountScanned() int
+	CountErrors() int
 }
 
 type impl struct {
-	mu       sync.Mutex
-	color    bool
-	verbose  bool
-	outPath  string
-	outFile  *os.File
-	enc      *json.Encoder
-	vulnCnt  int
-	scanned  int
+	mu      sync.Mutex
+	color   bool
+	verbose bool
+	outPath string
+	outFile *os.File
+	enc     *json.Encoder
+	vulnCnt int
+	errCnt  int
+	scanned int
 }
 
 func New(outPath string, color, verbose bool) Reporter {
@@ -55,6 +57,7 @@ func (r *impl) Report(res model.Result) {
 		r.vulnCnt++
 		r.printVuln(res)
 	case res.Error != "":
+		r.errCnt++
 		r.printErr(res)
 	case !res.PHP:
 		r.printSkip(res)
@@ -75,7 +78,11 @@ func (r *impl) printVuln(res model.Result) {
 	if res.Version != "" {
 		ver = " (PHP " + res.Version + ")"
 	}
-	fmt.Printf("%s %s%s\n", r.c("1;31", "[VULN]"), res.Target, ver)
+	exec := ""
+	if res.Exec {
+		exec = r.c("1;35", " [php-exec observed]")
+	}
+	fmt.Printf("%s %s%s%s\n", r.c("1;31", "[VULN]"), res.Target, ver, exec)
 	for _, v := range res.CVEs {
 		fmt.Printf("       %s\n", r.c("33", v))
 	}
@@ -106,7 +113,7 @@ func (r *impl) printSafe(res model.Result) {
 func (r *impl) printSkip(res model.Result) {
 	fmt.Printf("%s %s\n", r.c("1;90", "[SKIP]"), res.Target)
 	if r.verbose {
-		fmt.Printf("       - %s\n", r.c("2", "target does not appear to be PHP"))
+		fmt.Printf("       - %s\n", r.c("2", "not identified as PHP (headers) and PHP execution not observed (active probe)"))
 	}
 }
 
@@ -133,4 +140,10 @@ func (r *impl) CountScanned() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.scanned
+}
+
+func (r *impl) CountErrors() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.errCnt
 }

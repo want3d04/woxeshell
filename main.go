@@ -16,6 +16,8 @@ import (
 	"woxeshell/internal/target"
 )
 
+const version = "1.1.0"
+
 type headerFlags []string
 
 func (h *headerFlags) String() string { return strings.Join(*h, ", ") }
@@ -32,7 +34,7 @@ const banner = `
 | | | | |_| ) X (| ____|___ | | | | ____| | |
  \___/ \___(_/ \_)_____|___/|_| |_|_____)\_)_)
 
-            woxeshell - php2shell detection scanner v1.0
+            woxeshell - php2shell detection scanner v` + version + `
     CVE-2026-109618 / CVE-2026-109619  |  author : w4nt3d
 `
 
@@ -59,16 +61,33 @@ func main() {
 		verbose    = flag.Bool("v", false, "verbose")
 		noColor    = flag.Bool("no-color", false, "disable ANSI colors")
 		noBanner   = flag.Bool("no-banner", false, "suppress banner")
-		skipFinger = flag.Bool("skip-fingerprint", false, "skip PHP fingerprinting")
+		skipFinger = flag.Bool("skip-fingerprint", false, "assume PHP, skip passive fingerprinting")
 		retries    = flag.Int("retries", 1, "retries per request on transient errors")
+		probeMB    = flag.Int("probe-size", 32, "oversized-body probe size in MB (CVE-2026-109618)")
+		pairs      = flag.Int("pairs", 3, "A/B request pairs per target (CVE-2026-109619)")
+		settle     = flag.Duration("settle", time.Second, "wait after oversized request before health check")
+		showVer    = flag.Bool("version", false, "print version and exit")
 	)
 	var extraHeaders headerFlags
 	flag.Var(&extraHeaders, "H", "extra header 'Name: Value' (repeatable)")
 	flag.Usage = usage
 	flag.Parse()
 
+	if *showVer {
+		fmt.Println("woxeshell " + version)
+		return
+	}
+
 	if !*noBanner {
 		printBanner(*noColor)
+	}
+
+	if *probeMB < 1 {
+		*probeMB = 1
+	}
+	if *probeMB > 1024 {
+		fmt.Fprintln(os.Stderr, "warning: capping -probe-size to 1024 MB")
+		*probeMB = 1024
 	}
 
 	targets, err := target.Load(*urlFlag, *listFlag)
@@ -96,17 +115,20 @@ func main() {
 
 	rep := reporter.New(*outFlag, !*noColor, *verbose)
 	sc := scanner.New(scanner.Options{
-		Concurrency:  *conc,
-		Timeout:      *timeout,
-		RatePerSec:   *rate,
-		UserAgent:    *ua,
-		Verbose:      *verbose,
-		Reporter:     rep,
-		InsecureTLS:  *insecure,
-		ProxyURL:     *proxy,
-		ExtraHeaders: hdrs,
-		SkipFinger:   *skipFinger,
-		Retries:      *retries,
+		Concurrency:    *conc,
+		Timeout:        *timeout,
+		RatePerSec:     *rate,
+		UserAgent:      *ua,
+		Verbose:        *verbose,
+		Reporter:       rep,
+		InsecureTLS:    *insecure,
+		ProxyURL:       *proxy,
+		ExtraHeaders:   hdrs,
+		SkipFinger:     *skipFinger,
+		Retries:        *retries,
+		ProbeSizeBytes: int64(*probeMB) << 20,
+		Pairs:          *pairs,
+		Settle:         *settle,
 	})
 
 	start := time.Now()
@@ -115,6 +137,7 @@ func main() {
 
 	vuln := rep.CountVulnerable()
 	scanned := rep.CountScanned()
+	errs := rep.CountErrors()
 
 	summaryColor := func(code, s string) string {
 		if *noColor {
@@ -126,6 +149,9 @@ func main() {
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "summary: %d target(s) scanned in %s\n",
 		scanned, time.Since(start).Round(time.Millisecond))
+	if errs > 0 {
+		fmt.Fprintf(os.Stderr, "         %d target(s) unreachable or errored\n", errs)
+	}
 	if vuln > 0 {
 		fmt.Fprintf(os.Stderr, "result : %s\n", summaryColor("1;31", fmt.Sprintf("%d vulnerable", vuln)))
 	} else {

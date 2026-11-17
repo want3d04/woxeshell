@@ -2,60 +2,88 @@ package scanner
 
 import (
 	"context"
-	"io"
+	"fmt"
 	"net/http"
 	"strings"
 
 	"woxeshell/internal/payload"
 )
 
-func (s *Scanner) check109619(ctx context.Context, c *http.Client, target string) (bool, []string) {
-	mA, bodyA := payload.NewMarker()
-	mB, bodyB := payload.NewMarker()
+func (s *Scanner) check109619(ctx context.Context, target string) (vulnerable, executed bool, evidence []string) {
+	for i := 0; i < s.opts.Pairs; i++ {
+		select {
+		case <-ctx.Done():
+			return vulnerable, executed, evidence
+		default:
+		}
 
-	reqA, err := http.NewRequestWithContext(ctx, "POST", target, strings.NewReader(bodyA))
-	if err != nil {
-		return false, nil
-	}
-	s.applyHeaders(reqA)
-	reqA.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		mA, bodyA := payload.NewMarker()
+		mB := payload.MarkerPrefix + payload.RandomHex(12)
+		bodyB := payload.GlobalsDumpBody(mB)
 
-	respA, err := s.doWithRetry(ctx, c, reqA)
-	if err != nil {
-		return false, nil
-	}
-	textA, _ := io.ReadAll(io.LimitReader(respA.Body, 128*1024))
-	respA.Body.Close()
+		urlA := addQueryParam(target, "p2s", mA)
+		reqA, err := http.NewRequestWithContext(ctx, "POST", urlA, strings.NewReader(bodyA))
+		if err != nil {
+			continue
+		}
+		s.applyHeaders(reqA)
+		reqA.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		reqA.Header.Set("X-P2S-Marker", mA)
 
-	if !strings.Contains(string(textA), payload.SuccessCheck(mA)) {
-		return false, nil
+		respA, err := s.doWithRetry(ctx, reqA)
+		if err != nil {
+			if isCtxErr(err) {
+				return vulnerable, executed, evidence
+			}
+			evidence = append(evidence, fmt.Sprintf("109619: request A of pair %d failed: %v", i+1, err))
+			continue
+		}
+		textA := readAndClose(respA, 128<<10, 64<<10)
+		if !strings.Contains(textA, payload.SuccessCheck(mA)) {
+			continue
+		}
+		executed = true
+
+		urlB := addQueryParam(target, "cb", payload.RandomHex(6))
+		reqB, err := http.NewRequestWithContext(ctx, "POST", urlB, strings.NewReader(bodyB))
+		if err != nil {
+			continue
+		}
+		s.applyHeaders(reqB)
+		reqB.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		respB, err := s.doWithRetry(ctx, reqB)
+		if err != nil {
+			if isCtxErr(err) {
+				return vulnerable, executed, evidence
+			}
+			evidence = append(evidence, fmt.Sprintf("109619: request B of pair %d failed: %v", i+1, err))
+			continue
+		}
+		textB := readAndClose(respB, 256<<10, 64<<10)
+
+		bExec := strings.Contains(textB, payload.SuccessCheck(mB))
+		leak := strings.Contains(textB, mA)
+		if bExec && leak {
+			evidence = append(evidence,
+				fmt.Sprintf("109619: marker from request A (pair %d) found in response B global-state dump", i+1),
+				"109619: stale request-owned global state observed on the same worker",
+			)
+			return true, executed, evidence
+		}
+		if leak && !bExec {
+			
+			evidence = append(evidence,
+				fmt.Sprintf("109619: request A marker seen in response B of pair %d without execution proof; not counted (possible cache)", i+1))
+		}
 	}
 
-	reqB, err := http.NewRequestWithContext(ctx, "POST", target, strings.NewReader(bodyB))
-	if err != nil {
-		return false, nil
+	if executed {
+		evidence = append(evidence,
+			fmt.Sprintf("109619: PHP execution observed but no stale-state leak in %d pair(s)", s.opts.Pairs))
+	} else if len(evidence) == 0 {
+		evidence = append(evidence,
+			"109619: PHP execution precondition not met (POST body is not executed as PHP)")
 	}
-	s.applyHeaders(reqB)
-	reqB.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	respB, err := s.doWithRetry(ctx, c, reqB)
-	if err != nil {
-		return false, nil
-	}
-	defer respB.Body.Close()
-	textB, _ := io.ReadAll(io.LimitReader(respB.Body, 128*1024))
-	sB := string(textB)
-
-	var ev []string
-	if !strings.Contains(sB, payload.SuccessCheck(mB)) {
-		return false, ev
-	}
-	if strings.Contains(sB, payload.SuccessCheck(mA)) {
-		ev = append(ev,
-			"109619: marker from request A leaked into response B",
-			"109619: stale request-owned global state observed on same worker",
-		)
-		return true, ev
-	}
-	return false, ev
+	return vulnerable, executed, evidence
 }
